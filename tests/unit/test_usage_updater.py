@@ -37,9 +37,7 @@ async def test_clear_usage_refresh_state_clears_singleflight_cache() -> None:
         await release.wait()
         return usage_updater_module.AccountRefreshResult(usage_written=False)
 
-    first = asyncio.create_task(
-        usage_updater_module._USAGE_REFRESH_SINGLEFLIGHT.run("acc_singleflight_clear", factory)
-    )
+    first = asyncio.create_task(usage_updater_module._USAGE_REFRESH_SINGLEFLIGHT.run("acc_singleflight_clear", factory))
     await started.wait()
     usage_updater_module._clear_usage_refresh_state()
     assert usage_updater_module._USAGE_REFRESH_SINGLEFLIGHT._inflight == {}

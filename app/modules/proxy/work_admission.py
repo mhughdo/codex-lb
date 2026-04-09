@@ -41,9 +41,7 @@ class WorkAdmissionController:
         self._token_refresh = _make_gate(token_refresh_limit)
         self._websocket_connect = _make_gate(websocket_connect_limit)
         self._response_create = _make_gate(response_create_limit)
-        self._compact_response_create = (
-            _make_gate(compact_response_create_limit)
-        )
+        self._compact_response_create = _make_gate(compact_response_create_limit)
 
     async def acquire_token_refresh(self) -> AdmissionLease:
         return await self._acquire(self._token_refresh, stage="token_refresh")
