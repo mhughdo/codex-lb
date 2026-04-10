@@ -1314,7 +1314,7 @@ class ProxyService:
         upstream_control: _WebSocketUpstreamControl | None = None
         account: Account | None = None
         upstream_turn_state: str | None = _sticky_key_from_turn_state_header(headers)
-        downstream_idle_started_at: float | None = time.monotonic()
+        downstream_activity = _DownstreamWebSocketActivity()
 
         try:
             while True:
@@ -1325,21 +1325,27 @@ class ProxyService:
                         timeout=min(downstream_idle_timeout_seconds, _DOWNSTREAM_WEBSOCKET_RECEIVE_POLL_SECONDS),
                     )
                 except asyncio.TimeoutError:
-                    downstream_idle_started_at = await self._refresh_downstream_websocket_idle_started_at(
+                    if not await self._downstream_websocket_is_idle(
                         pending_requests,
                         pending_lock=pending_lock,
-                        idle_started_at=downstream_idle_started_at,
-                    )
-                    if downstream_idle_started_at is None:
+                        downstream_activity=downstream_activity,
+                        idle_timeout_seconds=downstream_idle_timeout_seconds,
+                    ):
                         continue
-                    if time.monotonic() - downstream_idle_started_at < downstream_idle_timeout_seconds:
-                        continue
-                    try:
-                        await websocket.close(code=1001, reason=_DOWNSTREAM_WEBSOCKET_IDLE_CLOSE_REASON)
-                    except Exception:
-                        logger.debug("Failed to close idle downstream websocket", exc_info=True)
+                    async with client_send_lock:
+                        if not await self._downstream_websocket_is_idle(
+                            pending_requests,
+                            pending_lock=pending_lock,
+                            downstream_activity=downstream_activity,
+                            idle_timeout_seconds=downstream_idle_timeout_seconds,
+                        ):
+                            continue
+                        try:
+                            await websocket.close(code=1001, reason=_DOWNSTREAM_WEBSOCKET_IDLE_CLOSE_REASON)
+                        except Exception:
+                            logger.debug("Failed to close idle downstream websocket", exc_info=True)
                     break
-                downstream_idle_started_at = time.monotonic()
+                downstream_activity.mark()
                 message_type = message["type"]
 
                 if message_type == "websocket.disconnect":
@@ -1441,7 +1447,6 @@ class ProxyService:
                         )
                         async with pending_lock:
                             pending_requests.append(request_state)
-                        downstream_idle_started_at = None
                         request_state_registered = True
                     except ProxyResponseError as exc:
                         error = _parse_openai_error(exc.payload)
@@ -1466,6 +1471,7 @@ class ProxyService:
                             error_code=error_code or "upstream_error",
                             error_message=error_message,
                             error_type=error_type,
+                            downstream_activity=downstream_activity,
                         )
                         _release_websocket_response_create_gate(request_state, response_create_gate)
                         continue
@@ -1548,6 +1554,7 @@ class ProxyService:
                             response_create_gate=response_create_gate,
                             proxy_request_budget_seconds=runtime_settings.proxy_request_budget_seconds,
                             stream_idle_timeout_seconds=runtime_settings.stream_idle_timeout_seconds,
+                            downstream_activity=downstream_activity,
                         )
                     )
 
@@ -1567,6 +1574,7 @@ class ProxyService:
                         websocket=websocket,
                         client_send_lock=client_send_lock,
                         response_create_gate=response_create_gate,
+                        downstream_activity=downstream_activity,
                     )
                     if upstream_reader is not None:
                         await _await_cancelled_task(upstream_reader, label="proxy websocket upstream reader")
@@ -1598,6 +1606,7 @@ class ProxyService:
                 websocket=websocket,
                 client_send_lock=client_send_lock,
                 response_create_gate=response_create_gate,
+                downstream_activity=downstream_activity,
             )
 
     async def _prepare_websocket_response_create_request(
@@ -3915,6 +3924,7 @@ class ProxyService:
         response_create_gate: asyncio.Semaphore,
         proxy_request_budget_seconds: float,
         stream_idle_timeout_seconds: float,
+        downstream_activity: _DownstreamWebSocketActivity,
     ) -> None:
         try:
             while True:
@@ -3969,6 +3979,7 @@ class ProxyService:
                     )
                     continue
                 if message.kind == "text" and message.text is not None:
+                    downstream_activity.mark()
                     await self._process_upstream_websocket_text(
                         message.text,
                         account=account,
@@ -3979,8 +3990,12 @@ class ProxyService:
                         upstream_control=upstream_control,
                         response_create_gate=response_create_gate,
                     )
-                    async with client_send_lock:
-                        await websocket.send_text(message.text)
+                    await self._send_downstream_websocket_text(
+                        websocket,
+                        client_send_lock=client_send_lock,
+                        text=message.text,
+                        downstream_activity=downstream_activity,
+                    )
                     if upstream_control.reconnect_requested:
                         async with pending_lock:
                             should_reconnect = not pending_requests
@@ -3992,8 +4007,13 @@ class ProxyService:
                             break
                     continue
                 if message.kind == "binary" and message.data is not None:
-                    async with client_send_lock:
-                        await websocket.send_bytes(message.data)
+                    downstream_activity.mark()
+                    await self._send_downstream_websocket_bytes(
+                        websocket,
+                        client_send_lock=client_send_lock,
+                        data=message.data,
+                        downstream_activity=downstream_activity,
+                    )
                     continue
                 await self._fail_pending_websocket_requests(
                     account_id_value=account_id_value,
@@ -4005,6 +4025,7 @@ class ProxyService:
                     websocket=websocket,
                     client_send_lock=client_send_lock,
                     response_create_gate=response_create_gate,
+                    downstream_activity=downstream_activity,
                 )
                 break
         finally:
@@ -4100,19 +4121,18 @@ class ProxyService:
             stream_idle_timeout_seconds=stream_idle_timeout_seconds,
         )
 
-    async def _refresh_downstream_websocket_idle_started_at(
+    async def _downstream_websocket_is_idle(
         self,
         pending_requests: deque[_WebSocketRequestState],
         *,
         pending_lock: anyio.Lock,
-        idle_started_at: float | None,
-    ) -> float | None:
+        downstream_activity: _DownstreamWebSocketActivity,
+        idle_timeout_seconds: float,
+    ) -> bool:
         async with pending_lock:
             if pending_requests:
-                return None
-        if idle_started_at is not None:
-            return idle_started_at
-        return time.monotonic()
+                return False
+        return (time.monotonic() - downstream_activity.last_activity_at) >= idle_timeout_seconds
 
     async def _fail_expired_pending_websocket_requests(
         self,
@@ -4350,6 +4370,7 @@ class ProxyService:
         websocket: WebSocket | None = None,
         client_send_lock: anyio.Lock | None = None,
         response_create_gate: asyncio.Semaphore | None = None,
+        downstream_activity: _DownstreamWebSocketActivity | None = None,
     ) -> None:
         async with pending_lock:
             remaining = list(pending_requests)
@@ -4392,6 +4413,7 @@ class ProxyService:
                     error_message=request_error_message,
                     error_type=request_error_type,
                     error_param=request_error_param,
+                    downstream_activity=downstream_activity,
                 )
             await self._release_websocket_reservation(request_state.api_key_reservation)
             if account_id_value is None or request_state.skip_request_log:
@@ -4424,6 +4446,7 @@ class ProxyService:
         error_message: str,
         error_type: str = "server_error",
         error_param: str | None = None,
+        downstream_activity: _DownstreamWebSocketActivity | None = None,
     ) -> None:
         event = response_failed_event(
             error_code,
@@ -4433,10 +4456,48 @@ class ProxyService:
             error_param=error_param,
         )
         try:
-            async with client_send_lock:
-                await websocket.send_text(json.dumps(event, ensure_ascii=True, separators=(",", ":")))
+            await self._send_downstream_websocket_text(
+                websocket,
+                client_send_lock=client_send_lock,
+                text=json.dumps(event, ensure_ascii=True, separators=(",", ":")),
+                downstream_activity=downstream_activity,
+            )
         except Exception:
             logger.debug("Failed to emit websocket terminal error", exc_info=True)
+
+    async def _send_downstream_websocket_text(
+        self,
+        websocket: WebSocket,
+        *,
+        client_send_lock: anyio.Lock,
+        text: str,
+        downstream_activity: _DownstreamWebSocketActivity | None = None,
+    ) -> None:
+        if downstream_activity is not None:
+            downstream_activity.mark()
+        async with client_send_lock:
+            if downstream_activity is not None:
+                downstream_activity.mark()
+            await websocket.send_text(text)
+            if downstream_activity is not None:
+                downstream_activity.mark()
+
+    async def _send_downstream_websocket_bytes(
+        self,
+        websocket: WebSocket,
+        *,
+        client_send_lock: anyio.Lock,
+        data: bytes,
+        downstream_activity: _DownstreamWebSocketActivity | None = None,
+    ) -> None:
+        if downstream_activity is not None:
+            downstream_activity.mark()
+        async with client_send_lock:
+            if downstream_activity is not None:
+                downstream_activity.mark()
+            await websocket.send_bytes(data)
+            if downstream_activity is not None:
+                downstream_activity.mark()
 
     async def _reserve_websocket_api_key_usage(
         self,
@@ -5964,6 +6025,14 @@ class _HTTPBridgeSession:
 @dataclass(slots=True)
 class _WebSocketUpstreamControl:
     reconnect_requested: bool = False
+
+
+@dataclass(slots=True)
+class _DownstreamWebSocketActivity:
+    last_activity_at: float = field(default_factory=time.monotonic)
+
+    def mark(self) -> None:
+        self.last_activity_at = time.monotonic()
 
 
 @dataclass(slots=True)
