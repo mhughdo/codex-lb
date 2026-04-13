@@ -702,6 +702,7 @@ def _should_deactivate_for_usage_error(exc: UsageFetchError) -> bool:
     lowered = exc.message.lower()
     return any(hint in lowered for hint in _DEACTIVATING_USAGE_MESSAGE_HINTS)
 
+
 def _mark_usage_refresh_auth_cooldown(account_id: str, status_code: int) -> None:
     if status_code not in {401, 403}:
         return
