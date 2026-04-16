@@ -672,13 +672,13 @@ class LoadBalancer:
         if existing:
             pinned = next((state for state in states if state.account_id == existing), None)
             if pinned is not None:
-                # Proactively rebind durable session affinity once the pinned
-                # account is already above the configured budget threshold.
-                # That preserves continuity below the threshold while avoiding
-                # obvious short-window failures once the session is skating on
-                # the edge of exhaustion.
+                # Proactively rebind session affinity for prompt-cache and
+                # codex sessions once the pinned account is already above the
+                # configured budget threshold. That preserves continuity below
+                # the threshold while avoiding obvious short-window failures
+                # once the session is skating on the edge of exhaustion.
                 now = time.time()
-                budget_exhausted = (
+                budget_pressured = (
                     sticky_kind in (StickySessionKind.PROMPT_CACHE, StickySessionKind.CODEX_SESSION)
                     and pinned.status != AccountStatus.RATE_LIMITED
                     and _state_above_budget_threshold(pinned, budget_threshold_pct)
@@ -689,7 +689,7 @@ class LoadBalancer:
                     and pinned.reset_at is not None
                     and pinned.reset_at - now >= 600  # 10 minutes
                 )
-                if not (budget_exhausted or rate_limit_far_away):
+                if not (budget_pressured or rate_limit_far_away):
                     pinned_result = select_account(
                         [pinned],
                         prefer_earlier_reset=prefer_earlier_reset_accounts,
@@ -706,7 +706,7 @@ class LoadBalancer:
                     # is above the budget threshold, reallocating just
                     # wastes DB writes and destroys prompt-cache locality
                     # (thrashing).
-                    if budget_exhausted:
+                    if budget_pressured:
                         pool_best = _select_account_preferring_budget_safe(
                             states,
                             prefer_earlier_reset=prefer_earlier_reset_accounts,
